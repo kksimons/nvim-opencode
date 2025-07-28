@@ -5,67 +5,40 @@
 local M = {}
 
 --- @class OpenCode.Config
---- @field port_range {min: integer, max: integer}
 --- @field auto_start boolean
 --- @field terminal_cmd string|nil
---- @field log_level "trace"|"debug"|"info"|"warn"|"error"
---- @field track_selection boolean Enable sending selection updates to OpenCode.
---- @field terminal { split_side: "left"|"right", split_width_percentage: number, provider: "auto"|"native", auto_close: boolean }
---- @field file_watcher { enabled: boolean, show_diffs: boolean, auto_reload: boolean }
---- @field keymaps { send_selection: string, toggle_focus: string }
+--- @field terminal { split_side: "left"|"right", split_width_percentage: number }
 
 --- @type OpenCode.Config
 local default_config = {
-	port_range = { min = 10000, max = 65535 },
 	auto_start = true,
 	terminal_cmd = nil,
-	log_level = "info",
-	track_selection = true,
 	terminal = {
 		split_side = "right",
 		split_width_percentage = 0.30,
-		provider = "auto",
-		auto_close = true,
-	},
-	file_watcher = {
-		enabled = true,
-		show_diffs = true,
-		auto_reload = false,
-	},
-	keymaps = {
-		send_selection = "a",
-		toggle_focus = "<C-w>a",
 	},
 }
 
 --- @class OpenCode.State
 --- @field config OpenCode.Config
---- @field server table|nil
---- @field port number|nil
---- @field auth_token string|nil
 --- @field initialized boolean
 --- @field terminal_buf number|nil
 --- @field terminal_win number|nil
---- @field file_watchers table<string, number>
---- @field session_file string|nil
 --- @field last_esc_time number|nil
---- @field pending_diffs table<string, table>
 --- @field last_focus "nvim"|"opencode"
 
 --- @type OpenCode.State
 M.state = {
 	config = vim.deepcopy(default_config),
-	server = nil,
-	port = nil,
-	auth_token = nil,
 	initialized = false,
 	terminal_buf = nil,
-	terminal_win = nil,
-	file_watchers = {},
-	session_file = nil,
+	terminal_win = nil, 
 	last_esc_time = nil,
-	pending_diffs = {},
 	last_focus = "nvim",
+	port = nil,
+	current_session = nil,
+	file_context_added = false,
+	file_context_path = nil,
 }
 
 -- Simple logger
@@ -80,9 +53,7 @@ local logger = {
 		print("[OpenCode:" .. context .. "] ERROR: " .. msg)
 	end,
 	debug = function(context, msg)
-		if M.state.config.log_level == "debug" then
-			print("[OpenCode:" .. context .. "] DEBUG: " .. msg)
-		end
+		print("[OpenCode:" .. context .. "] DEBUG: " .. msg)
 	end,
 }
 
@@ -113,460 +84,90 @@ local function get_opencode_cmd()
 	return "opencode"
 end
 
--- Simple WebSocket server implementation
-local function create_websocket_server(port, auth_token)
-	local server = {}
-	local clients = {}
 
-	-- Mock server for now - in a real implementation this would be a proper WebSocket server
-	server.start = function()
-		logger.debug("server", "Starting WebSocket server on port " .. port)
-		return true
-	end
 
-	server.stop = function()
-		logger.debug("server", "Stopping WebSocket server")
-		clients = {}
-		return true
-	end
 
-	server.broadcast = function(event, data)
-		logger.debug("server", "Broadcasting event: " .. event)
-		-- In a real implementation, this would send data to connected clients
-		return true
-	end
 
-	server.get_client_count = function()
-		return #clients
-	end
 
-	return server
-end
 
--- Create lock file for opencode to discover
-local function create_lock_file(port, auth_token)
-	local opencode_dir = vim.fn.expand("~/.opencode")
-	local ide_dir = opencode_dir .. "/ide"
-
-	-- Create directories if they don't exist
-	vim.fn.mkdir(ide_dir, "p")
-
-	local lock_file = ide_dir .. "/" .. port .. ".lock"
-	local lock_data = {
-		port = port,
-		auth_token = auth_token,
-		pid = vim.fn.getpid(),
-		editor = "neovim",
-		version = "1.0.0",
-	}
-
-	local file = io.open(lock_file, "w")
-	if not file then
-		return false, "Failed to create lock file"
-	end
-
-	file:write(vim.json.encode(lock_data))
-	file:close()
-
-	logger.debug("lockfile", "Created lock file: " .. lock_file)
-	return true, lock_file
-end
-
--- Remove lock file
-local function remove_lock_file(port)
+-- HTTP client for OpenCode server
+local function http_request(port, endpoint, method, data)
 	if not port then
+		logger.error("http", "No port specified for HTTP request")
+		return false, "No port"
+	end
+
+	method = method or "GET"
+	local cmd
+	if method == "POST" and data then
+		cmd = string.format(
+			'curl -s -X POST -H "Content-Type: application/json" -d %s "http://localhost:%d%s"',
+			vim.fn.shellescape(vim.json.encode(data)),
+			port,
+			endpoint
+		)
+	elseif method == "DELETE" then
+		cmd = string.format('curl -s -X DELETE "http://localhost:%d%s"', port, endpoint)
+	else
+		cmd = string.format('curl -s "http://localhost:%d%s"', port, endpoint)
+	end
+	
+	local result = vim.fn.system(cmd)
+	local success = vim.v.shell_error == 0
+	if success and result ~= "" then
+		local ok, decoded = pcall(vim.json.decode, result)
+		if ok then
+			return true, decoded
+		end
+	end
+	return success, result
+end
+
+-- Wait for OpenCode server to be ready
+local function wait_for_server(port, max_tries)
+	max_tries = max_tries or 50
+	local tries = 0
+	
+	while tries < max_tries do
+		local success = http_request(port, "/app")
+		if success then
+			return true
+		end
+		
+		tries = tries + 1
+		vim.wait(200) -- Wait 200ms between tries
+	end
+	
+	return false
+end
+
+-- Send text to OpenCode server
+local function send_to_opencode(port, text)
+	local success, result = http_request(port, "/tui/paste", "POST", { text = text })
+	if success then
+		local lines_count = 0
+		if type(text) == "string" then
+			for _ in text:gmatch("\n") do
+				lines_count = lines_count + 1
+			end
+			lines_count = lines_count + 1
+			local summary = string.format("[PASTED %d lines]", lines_count)
+			-- Show summary in prompt
+			http_request(port, "/tui/replace-prompt", "POST", { text = summary })
+		else
+			http_request(port, "/tui/replace-prompt", "POST", { text = "[PASTED MULTI-LINE TEXT]" })
+		end
+		logger.info("server", "Sent to OpenCode using paste endpoint")
 		return true
-	end
-
-	local lock_file = vim.fn.expand("~/.opencode/ide/" .. port .. ".lock")
-	if vim.fn.filereadable(lock_file) == 1 then
-		vim.fn.delete(lock_file)
-		logger.debug("lockfile", "Removed lock file: " .. lock_file)
-	end
-	return true
-end
-
--- Generate auth token
-local function generate_auth_token()
-	local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	local token = ""
-	for i = 1, 32 do
-		local rand = math.random(1, #chars)
-		token = token .. chars:sub(rand, rand)
-	end
-	return token
-end
-
--- File watcher functionality
-local function setup_file_watcher(file_path)
-	if not M.state.config.file_watcher.enabled then
-		return
-	end
-
-	local buf = vim.fn.bufnr(file_path)
-	if buf == -1 then
-		return
-	end
-
-	-- Remove existing watcher if any
-	if M.state.file_watchers[file_path] then
-		vim.api.nvim_del_autocmd(M.state.file_watchers[file_path])
-	end
-
-	-- Create new watcher
-	local autocmd_id = vim.api.nvim_create_autocmd({ "BufWritePost" }, {
-		buffer = buf,
-		callback = function()
-			if M.state.config.file_watcher.show_diffs then
-				-- Use the new inline diff system
-				M.show_inline_diffs(file_path)
-			end
-			-- Notify opencode of file change
-			if M.state.server then
-				M.state.server.broadcast("file_changed", {
-					filePath = file_path,
-					timestamp = os.time(),
-				})
-			end
-		end,
-		desc = "OpenCode file watcher for " .. file_path,
-	})
-
-	M.state.file_watchers[file_path] = autocmd_id
-end
-
--- Show diff for a file
-function show_file_diff(file_path)
-	-- Get git diff for the file
-	local diff_cmd = string.format("git diff HEAD -- %s", vim.fn.shellescape(file_path))
-	local diff_output = vim.fn.system(diff_cmd)
-
-	if vim.v.shell_error == 0 and diff_output ~= "" then
-		-- Create a floating window to show the diff
-		local buf = vim.api.nvim_create_buf(false, true)
-		local lines = vim.split(diff_output, "\n")
-		vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-		vim.api.nvim_buf_set_option(buf, "filetype", "diff")
-		vim.api.nvim_buf_set_option(buf, "modifiable", false)
-
-		local width = math.floor(vim.o.columns * 0.8)
-		local height = math.min(#lines + 2, math.floor(vim.o.lines * 0.6))
-		local row = math.floor((vim.o.lines - height) / 2)
-		local col = math.floor((vim.o.columns - width) / 2)
-
-		local win = vim.api.nvim_open_win(buf, false, {
-			relative = "editor",
-			width = width,
-			height = height,
-			row = row,
-			col = col,
-			style = "minimal",
-			border = "rounded",
-			title = " Git Diff: " .. vim.fn.fnamemodify(file_path, ":t") .. " ",
-			title_pos = "center",
-		})
-
-		-- Auto-close after 5 seconds or on any key press
-		vim.defer_fn(function()
-			if vim.api.nvim_win_is_valid(win) then
-				vim.api.nvim_win_close(win, true)
-			end
-		end, 5000)
-
-		-- Close on any key press
-		vim.api.nvim_buf_set_keymap(buf, "n", "<Esc>", "<cmd>close<cr>", { noremap = true, silent = true })
-		vim.api.nvim_buf_set_keymap(buf, "n", "q", "<cmd>close<cr>", { noremap = true, silent = true })
-	end
-end
-
--- Enhanced diff system with accept/reject functionality
-local diff_namespace = vim.api.nvim_create_namespace("opencode_diffs")
-
--- Parse git diff output into structured format
-local function parse_diff(diff_output)
-	local hunks = {}
-	local current_hunk = nil
-	local lines = vim.split(diff_output, "\n")
-	
-	for _, line in ipairs(lines) do
-		-- Match hunk header: @@ -old_start,old_count +new_start,new_count @@
-		local old_start, old_count, new_start, new_count = line:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
-		if old_start then
-			if current_hunk then
-				table.insert(hunks, current_hunk)
-			end
-			current_hunk = {
-				old_start = tonumber(old_start),
-				old_count = tonumber(old_count) or 1,
-				new_start = tonumber(new_start),
-				new_count = tonumber(new_count) or 1,
-				lines = {}
-			}
-		elseif current_hunk then
-			-- Parse diff lines
-			local prefix = line:sub(1, 1)
-			local content = line:sub(2)
-			if prefix == "+" or prefix == "-" or prefix == " " then
-				table.insert(current_hunk.lines, {
-					type = prefix == "+" and "add" or (prefix == "-" and "remove" or "context"),
-					content = content
-				})
-			end
-		end
-	end
-	
-	if current_hunk then
-		table.insert(hunks, current_hunk)
-	end
-	
-	return hunks
-end
-
--- Show inline diffs with virtual text and signs
-function M.show_inline_diffs(file_path)
-	-- Get the buffer for this file
-	local bufnr = nil
-	for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-		if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_get_name(buf) == file_path then
-			bufnr = buf
-			break
-		end
-	end
-	
-	if not bufnr then
-		logger.warn("diff", "Buffer not found for file: " .. file_path)
-		return
-	end
-	
-	-- Get git diff
-	local diff_cmd = string.format("git diff HEAD -- %s", vim.fn.shellescape(file_path))
-	local diff_output = vim.fn.system(diff_cmd)
-	
-	if vim.v.shell_error ~= 0 or diff_output == "" then
-		logger.debug("diff", "No diff found for file: " .. file_path)
-		return
-	end
-	
-	-- Parse the diff
-	local hunks = parse_diff(diff_output)
-	if #hunks == 0 then
-		return
-	end
-	
-	-- Store pending diffs for this file
-	M.state.pending_diffs[file_path] = {
-		bufnr = bufnr,
-		hunks = hunks,
-		original_content = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-	}
-	
-	-- Clear existing diff highlights
-	vim.api.nvim_buf_clear_namespace(bufnr, diff_namespace, 0, -1)
-	
-	-- Apply diff highlights and virtual text
-	for hunk_idx, hunk in ipairs(hunks) do
-		local line_num = hunk.new_start - 1 -- Convert to 0-based
-		
-		-- Add signs and highlights for changed lines
-		for i, diff_line in ipairs(hunk.lines) do
-			if diff_line.type == "add" then
-				-- Highlight added lines
-				vim.api.nvim_buf_add_highlight(bufnr, diff_namespace, "DiffAdd", line_num, 0, -1)
-				-- Add sign
-				vim.fn.sign_place(0, "opencode_diff", "OpenCodeDiffAdd", bufnr, {lnum = line_num + 1})
-				line_num = line_num + 1
-			elseif diff_line.type == "remove" then
-				-- Show removed lines as virtual text
-				vim.api.nvim_buf_set_extmark(bufnr, diff_namespace, line_num, 0, {
-					virt_lines = {{{"- " .. diff_line.content, "DiffDelete"}}},
-					virt_lines_above = true,
-				})
-			else -- context
-				line_num = line_num + 1
-			end
-		end
-		
-		-- Add virtual text with accept/reject instructions
-		vim.api.nvim_buf_set_extmark(bufnr, diff_namespace, hunk.new_start - 1, 0, {
-			virt_text = {{string.format(" [Hunk %d] <leader>da: accept, <leader>dr: reject, <leader>dd: accept all", hunk_idx), "Comment"}},
-			virt_text_pos = "eol",
-		})
-	end
-	
-	logger.info("diff", string.format("Showing %d diff hunks for %s", #hunks, vim.fn.fnamemodify(file_path, ":t")))
-end
-
--- Accept a specific diff hunk
-function M.accept_diff_hunk(file_path, hunk_idx)
-	local pending = M.state.pending_diffs[file_path]
-	if not pending or not pending.hunks[hunk_idx] then
-		logger.error("diff", "No pending diff hunk found")
-		return
-	end
-	
-	-- Remove the hunk from pending diffs
-	table.remove(pending.hunks, hunk_idx)
-	
-	-- If no more hunks, clear all diff highlights
-	if #pending.hunks == 0 then
-		M.clear_diff_highlights(file_path)
-		M.state.pending_diffs[file_path] = nil
 	else
-		-- Refresh the diff display
-		M.show_inline_diffs(file_path)
-	end
-	
-	logger.info("diff", "Accepted diff hunk " .. hunk_idx)
-end
-
--- Reject a specific diff hunk
-function M.reject_diff_hunk(file_path, hunk_idx)
-	local pending = M.state.pending_diffs[file_path]
-	if not pending or not pending.hunks[hunk_idx] then
-		logger.error("diff", "No pending diff hunk found")
-		return
-	end
-	
-	local hunk = pending.hunks[hunk_idx]
-	local bufnr = pending.bufnr
-	
-	-- Revert the changes for this hunk
-	-- This is a simplified approach - in practice, you'd want more sophisticated merging
-	local start_line = hunk.new_start - 1
-	local end_line = start_line + hunk.new_count
-	
-	-- Get the original lines for this hunk
-	local original_lines = {}
-	for i = hunk.old_start, hunk.old_start + hunk.old_count - 1 do
-		if pending.original_content[i] then
-			table.insert(original_lines, pending.original_content[i])
-		end
-	end
-	
-	-- Replace the lines in the buffer
-	vim.api.nvim_buf_set_lines(bufnr, start_line, end_line, false, original_lines)
-	
-	-- Remove the hunk from pending diffs
-	table.remove(pending.hunks, hunk_idx)
-	
-	-- If no more hunks, clear all diff highlights
-	if #pending.hunks == 0 then
-		M.clear_diff_highlights(file_path)
-		M.state.pending_diffs[file_path] = nil
-	else
-		-- Refresh the diff display
-		M.show_inline_diffs(file_path)
-	end
-	
-	logger.info("diff", "Rejected diff hunk " .. hunk_idx)
-end
-
--- Accept all diff hunks for a file
-function M.accept_all_diffs(file_path)
-	local pending = M.state.pending_diffs[file_path]
-	if not pending then
-		logger.error("diff", "No pending diffs found")
-		return
-	end
-	
-	M.clear_diff_highlights(file_path)
-	M.state.pending_diffs[file_path] = nil
-	
-	logger.info("diff", "Accepted all diffs for " .. vim.fn.fnamemodify(file_path, ":t"))
-end
-
--- Reject all diff hunks for a file
-function M.reject_all_diffs(file_path)
-	local pending = M.state.pending_diffs[file_path]
-	if not pending then
-		logger.error("diff", "No pending diffs found")
-		return
-	end
-	
-	local bufnr = pending.bufnr
-	
-	-- Revert entire file to original content
-	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, pending.original_content)
-	
-	M.clear_diff_highlights(file_path)
-	M.state.pending_diffs[file_path] = nil
-	
-	logger.info("diff", "Rejected all diffs for " .. vim.fn.fnamemodify(file_path, ":t"))
-end
-
--- Clear diff highlights for a file
-function M.clear_diff_highlights(file_path)
-	local pending = M.state.pending_diffs[file_path]
-	if not pending then
-		return
-	end
-	
-	local bufnr = pending.bufnr
-	vim.api.nvim_buf_clear_namespace(bufnr, diff_namespace, 0, -1)
-	vim.fn.sign_unplace("opencode_diff", {buffer = bufnr})
-end
-
--- Session management
-local function get_session_file()
-	local cwd = vim.fn.getcwd()
-	local session_dir = vim.fn.expand("~/.opencode/sessions")
-	vim.fn.mkdir(session_dir, "p")
-	local session_name = string.gsub(cwd, "/", "_")
-	return session_dir .. "/" .. session_name .. ".json"
-end
-
-local function save_session()
-	if not M.state.port or not M.state.auth_token then
-		return
-	end
-
-	local session_data = {
-		port = M.state.port,
-		auth_token = M.state.auth_token,
-		cwd = vim.fn.getcwd(),
-		timestamp = os.time(),
-	}
-
-	local session_file = get_session_file()
-	local file = io.open(session_file, "w")
-	if file then
-		file:write(vim.json.encode(session_data))
-		file:close()
-		M.state.session_file = session_file
-		logger.debug("session", "Session saved to " .. session_file)
+		logger.error("server", "Failed to send paste to OpenCode: " .. (result or "unknown error"))
+		return false
 	end
 end
 
-local function load_session()
-	local session_file = get_session_file()
-	local file = io.open(session_file, "r")
-	if not file then
-		return nil
-	end
-
-	local content = file:read("*all")
-	file:close()
-
-	local ok, session_data = pcall(vim.json.decode, content)
-	if not ok or not session_data then
-		return nil
-	end
-
-	-- Check if session is recent (within 24 hours)
-	if os.time() - session_data.timestamp > 86400 then
-		return nil
-	end
-
-	return session_data
-end
-
--- Find available port
-local function find_available_port()
-	for port = M.state.config.port_range.min, M.state.config.port_range.max do
-		-- Simple check - in a real implementation you'd actually test the port
-		return port
-	end
-	return nil
+-- Generate a random port for OpenCode server
+local function generate_port()
+	return math.random(16384, 65535)
 end
 
 -- Terminal management
@@ -574,6 +175,10 @@ local function create_terminal()
 	local opencode_cmd = get_opencode_cmd()
 	local cwd = vim.fn.getcwd()
 
+	-- Generate a random port for the server
+	local port = generate_port()
+	M.state.port = port -- Store port for API calls
+	
 	-- Save current window
 	local current_win = vim.api.nvim_get_current_win()
 
@@ -593,70 +198,17 @@ local function create_terminal()
 	local term_buf = vim.api.nvim_create_buf(false, true)
 	vim.api.nvim_win_set_buf(term_win, term_buf)
 
-	-- Get terminal dimensions for proper sizing
-	local term_height = vim.api.nvim_win_get_height(term_win)
-	local term_width = vim.api.nvim_win_get_width(term_win)
-
-	-- Set environment variables for opencode to find our server AND proper terminal sizing
-	local env = vim.tbl_extend("force", vim.fn.environ(), {
-		OPENCODE_IDE_PORT = tostring(M.state.port),
-		OPENCODE_IDE_AUTH = M.state.auth_token,
-		COLUMNS = tostring(term_width),
-		LINES = tostring(term_height),
-		TERM = "xterm-256color",
-		FORCE_COLOR = "1",
-		COLORTERM = "truecolor",
-		-- Force system theme for embedded terminals (fixes layout issues)
-		OPENCODE_THEME = "system",
-		-- Mark as embedded terminal for potential future detection
-		OPENCODE_EMBEDDED = "1",
-		OPENCODE_CALLER = "nvim",
-	})
-
-	-- Create simple terminal initialization script with proper environment
-	local init_script = string.format(
-		[[
-    # Set up terminal environment for opencode
-    export TERM=xterm-256color
-    export COLUMNS=%d
-    export LINES=%d
-    export FORCE_COLOR=1
-    export COLORTERM=truecolor
-    
-    # Force system theme for embedded terminals (fixes layout issues)
-    export OPENCODE_THEME=system
-    export OPENCODE_EMBEDDED=1
-    export OPENCODE_CALLER=nvim
-    
-    # Disable any terminal detection that might interfere
-    unset TERM_PROGRAM
-    unset VSCODE_INJECTION
-    unset NVIM
-    unset NVIM_LISTEN_ADDRESS
-    
-    # Set proper terminal size
-    stty rows %d cols %d 2>/dev/null || true
-    
-    # Force terminal to be in a clean state
-    printf '\033c'  # Reset terminal
-    printf '\033[?1049h'  # Enable alternate screen
-    printf '\033[2J\033[H'  # Clear screen and home cursor
-    
-    # Start opencode with proper size from the beginning
-    exec %s %s
-  ]],
-		term_width,
-		term_height,
-		term_height,
-		term_width,
+	-- Start OpenCode in server mode (like VSCode does)
+	local opencode_command = string.format(
+		"OPENCODE_THEME=system OPENCODE_CALLER=nvim %s --port %d %s",
 		opencode_cmd,
+		port,
 		cwd
 	)
 
-	-- Start opencode with proper terminal initialization
-	local job_id = vim.fn.termopen({ "bash", "-c", init_script }, {
+	-- Start opencode with server mode
+	local job_id = vim.fn.termopen(opencode_command, {
 		cwd = cwd,
-		env = env,
 		on_exit = function()
 			M.close_terminal()
 		end,
@@ -670,7 +222,7 @@ local function create_terminal()
 	M.state.terminal_buf = term_buf
 	M.state.terminal_win = term_win
 
-	-- Set terminal window options
+	-- Set terminal window options - disable ALL visual elements
 	vim.wo[term_win].number = false
 	vim.wo[term_win].relativenumber = false
 	vim.wo[term_win].signcolumn = "no"
@@ -679,6 +231,9 @@ local function create_terminal()
 	vim.wo[term_win].cursorcolumn = false
 	vim.wo[term_win].colorcolumn = ""
 	vim.wo[term_win].foldcolumn = "0"
+	vim.wo[term_win].statuscolumn = ""
+	vim.wo[term_win].linebreak = false
+	vim.wo[term_win].breakindent = false
 
 	-- Set buffer options
 	vim.bo[term_buf].bufhidden = "hide"
@@ -688,7 +243,7 @@ local function create_terminal()
 	vim.api.nvim_buf_set_keymap(
 		term_buf,
 		"t",
-		"<leader>a",
+		"<leader>A",
 		'<C-\\><C-n>:lua require("opencode").toggle_terminal()<CR>',
 		{ noremap = true, silent = true, desc = "Toggle OpenCode terminal" }
 	)
@@ -699,20 +254,20 @@ local function create_terminal()
 		'<C-\\><C-n>:lua require("opencode").focus_nvim()<CR>',
 		{ noremap = true, silent = true, desc = "Focus Neovim from OpenCode terminal" }
 	)
-	-- Add '0' and '1' keymaps for focus switching
-	vim.api.nvim_buf_set_keymap(
-		term_buf,
-		"t",
-		"0",
-		'<C-\\><C-n>:lua require("opencode").focus_opencode()<CR>',
-		{ noremap = true, silent = true, desc = "Focus OpenCode terminal" }
-	)
+	-- Add '1' and '9' keymaps for focus switching
 	vim.api.nvim_buf_set_keymap(
 		term_buf,
 		"t",
 		"1",
 		'<C-\\><C-n>:lua require("opencode").focus_nvim()<CR>',
-		{ noremap = true, silent = true, desc = "Focus Neovim from OpenCode terminal" }
+		{ noremap = true, silent = true, desc = "Focus Neovim editor" }
+	)
+	vim.api.nvim_buf_set_keymap(
+		term_buf,
+		"t",
+		"9",
+		'<C-\\><C-n>:lua require("opencode").focus_opencode()<CR>',
+		{ noremap = true, silent = true, desc = "Focus OpenCode terminal" }
 	)
 
 	-- Set up autocmd to handle window resizing
@@ -762,15 +317,6 @@ function M.toggle_terminal()
 		M.state.terminal_win = nil
 		M.focus_nvim()
 	else
-		if not M.state.server then
-			-- Try to start with existing session
-			local started = M.start()
-			if not started then
-				logger.error("terminal", "Failed to start OpenCode integration")
-				return
-			end
-		end
-
 		if M.state.terminal_buf and vim.api.nvim_buf_is_valid(M.state.terminal_buf) then
 			-- Reopen existing terminal buffer
 			reopen_terminal()
@@ -802,7 +348,7 @@ function reopen_terminal()
 	vim.api.nvim_win_set_buf(term_win, M.state.terminal_buf)
 	M.state.terminal_win = term_win
 
-	-- Set terminal window options
+	-- Set terminal window options - disable ALL visual elements
 	vim.wo[term_win].number = false
 	vim.wo[term_win].relativenumber = false
 	vim.wo[term_win].signcolumn = "no"
@@ -811,12 +357,15 @@ function reopen_terminal()
 	vim.wo[term_win].cursorcolumn = false
 	vim.wo[term_win].colorcolumn = ""
 	vim.wo[term_win].foldcolumn = "0"
+	vim.wo[term_win].statuscolumn = ""
+	vim.wo[term_win].linebreak = false
+	vim.wo[term_win].breakindent = false
 
 	-- Set up terminal-specific keymaps for reopened terminal
 	vim.api.nvim_buf_set_keymap(
 		M.state.terminal_buf,
 		"t",
-		"<leader>a",
+		"<leader>A",
 		'<C-\\><C-n>:lua require("opencode").toggle_terminal()<CR>',
 		{ noremap = true, silent = true, desc = "Toggle OpenCode terminal" }
 	)
@@ -827,20 +376,20 @@ function reopen_terminal()
 		'<C-\\><C-n>:lua require("opencode").focus_nvim()<CR>',
 		{ noremap = true, silent = true, desc = "Focus Neovim from OpenCode terminal" }
 	)
-	-- Add '0' and '1' keymaps for focus switching
-	vim.api.nvim_buf_set_keymap(
-		M.state.terminal_buf,
-		"t",
-		"0",
-		'<C-\\><C-n>:lua require("opencode").focus_opencode()<CR>',
-		{ noremap = true, silent = true, desc = "Focus OpenCode terminal" }
-	)
+	-- Add '1' and '9' keymaps for focus switching
 	vim.api.nvim_buf_set_keymap(
 		M.state.terminal_buf,
 		"t",
 		"1",
 		'<C-\\><C-n>:lua require("opencode").focus_nvim()<CR>',
-		{ noremap = true, silent = true, desc = "Focus Neovim from OpenCode terminal" }
+		{ noremap = true, silent = true, desc = "Focus Neovim editor" }
+	)
+	vim.api.nvim_buf_set_keymap(
+		M.state.terminal_buf,
+		"t",
+		"9",
+		'<C-\\><C-n>:lua require("opencode").focus_opencode()<CR>',
+		{ noremap = true, silent = true, desc = "Focus OpenCode terminal" }
 	)
 
 	-- Focus the terminal and enter insert mode
@@ -850,112 +399,10 @@ function reopen_terminal()
 	logger.info("terminal", "OpenCode terminal reopened")
 end
 
--- Start the OpenCode integration
-function M.start()
-	if M.state.server then
-		logger.warn("init", "OpenCode integration is already running on port " .. tostring(M.state.port))
-		return false, "Already running"
-	end
 
-	-- Try to load existing session first
-	local session_data = load_session()
-	local auth_token, port
 
-	if session_data then
-		auth_token = session_data.auth_token
-		port = session_data.port
-		logger.info("init", "Restored session on port " .. tostring(port))
-	else
-		-- Generate new auth token
-		auth_token = generate_auth_token()
-		if not auth_token then
-			logger.error("init", "Failed to generate authentication token")
-			return false, "Failed to generate auth token"
-		end
-
-		-- Find available port
-		port = find_available_port()
-		if not port then
-			logger.error("init", "No available ports in range")
-			return false, "No available ports"
-		end
-	end
-
-	-- Create WebSocket server
-	local server = create_websocket_server(port, auth_token)
-	local success = server.start()
-
-	if not success then
-		logger.error("init", "Failed to start WebSocket server")
-		return false, "Failed to start server"
-	end
-
-	-- Create lock file
-	local lock_success, lock_result = create_lock_file(port, auth_token)
-	if not lock_success then
-		server.stop()
-		logger.error("init", "Failed to create lock file: " .. lock_result)
-		return false, lock_result
-	end
-
-	M.state.server = server
-	M.state.port = port
-	M.state.auth_token = auth_token
-
-	-- Save session
-	save_session()
-
-	logger.info("init", "OpenCode integration started on port " .. tostring(port))
-	return true, port
-end
-
--- Stop the OpenCode integration
-function M.stop(preserve_session)
-	if not M.state.server then
-		logger.warn("init", "OpenCode integration is not running")
-		return false, "Not running"
-	end
-
-	-- Close terminal if open
-	M.close_terminal()
-
-	-- Clear file watchers
-	for file_path, autocmd_id in pairs(M.state.file_watchers) do
-		vim.api.nvim_del_autocmd(autocmd_id)
-	end
-	M.state.file_watchers = {}
-
-	-- Remove lock file
-	remove_lock_file(M.state.port)
-
-	-- Stop server
-	local success = M.state.server.stop()
-	if not success then
-		logger.error("init", "Failed to stop server")
-		return false, "Failed to stop server"
-	end
-
-	-- Clean up session if not preserving
-	if not preserve_session and M.state.session_file then
-		vim.fn.delete(M.state.session_file)
-		M.state.session_file = nil
-	end
-
-	M.state.server = nil
-	M.state.port = nil
-	M.state.auth_token = nil
-
-	logger.info("init", "OpenCode integration stopped")
-	return true
-end
-
--- Send file to opencode
+-- Send file to opencode with content
 function M.send_file(file_path, start_line, end_line)
-	if not M.state.server then
-		logger.error("command", "OpenCode integration is not running")
-		return false, "Integration not running"
-	end
-
 	-- Format file path
 	local formatted_path = file_path
 	local cwd = vim.fn.getcwd()
@@ -963,102 +410,83 @@ function M.send_file(file_path, start_line, end_line)
 		formatted_path = string.sub(file_path, #cwd + 2)
 	end
 
-	-- Send to opencode
-	local params = {
-		filePath = formatted_path,
-		lineStart = start_line,
-		lineEnd = end_line,
-	}
-
-	local success = M.state.server.broadcast("file_mentioned", params)
-	if success then
-		logger.debug("command", "Sent file to OpenCode: " .. formatted_path)
-		-- Set up file watcher for this file
-		setup_file_watcher(file_path)
-		return true
+	-- Read file content
+	local content
+	if start_line and end_line then
+		-- Read specific line range
+		local lines = vim.fn.readfile(file_path)
+		if #lines > 0 then
+			local selected_lines = {}
+			for i = start_line + 1, math.min(end_line + 1, #lines) do
+				table.insert(selected_lines, lines[i])
+			end
+			content = table.concat(selected_lines, "\n")
+		else
+			content = ""
+		end
 	else
-		logger.error("command", "Failed to send file to OpenCode: " .. formatted_path)
-		return false, "Failed to send file"
-	end
-end
-
--- Send selected text to opencode
-function M.send_selection()
-	if not M.state.server then
-		logger.error("command", "OpenCode integration is not running")
-		return false, "Integration not running"
+		-- Read entire file
+		local lines = vim.fn.readfile(file_path)
+		content = table.concat(lines, "\n")
 	end
 
-	-- Get visual selection using a simpler, more reliable method
-	-- Use the yank register approach which always works
-	local selected_lines
-	
-	-- Save current register content
-	local save_reg = vim.fn.getreg('"')
-	local save_regtype = vim.fn.getregtype('"')
-	
-	-- Yank the visual selection to get the text
-	vim.cmd('normal! gv"zy')
-	local selected_text = vim.fn.getreg('z')
-	
-	-- Restore the register
-	vim.fn.setreg('"', save_reg, save_regtype)
-	
-	if selected_text == "" then
-		logger.error("command", "No text selected")
-		return false, "No selection"
-	end
-	
-	-- Split into lines for consistency with other methods
-	selected_lines = vim.split(selected_text, '\n', {plain = true})
-
-	if #selected_lines == 0 or (selected_lines[1] == "" and #selected_lines == 1) then
-		logger.error("command", "No text selected")
-		return false, "No selection"
+	-- Format the message to send to OpenCode
+	local message
+	if start_line and end_line then
+		message = string.format("File: %s (lines %d-%d)\n```\n%s\n```", 
+			formatted_path, start_line + 1, end_line + 1, content)
+	else
+		message = string.format("File: %s\n```\n%s\n```", formatted_path, content)
 	end
 
-	local text_content = table.concat(selected_lines, "\n")
-	local file_path = vim.api.nvim_buf_get_name(0)
-
-	-- Debug logging
-	logger.debug("command", "Selected text: " .. text_content)
-	logger.debug("command", "Selection length: " .. string.len(text_content) .. " characters")
-
-	-- Send to opencode terminal directly by typing the text
+	-- Send to opencode terminal
 	if M.state.terminal_buf and vim.api.nvim_buf_is_valid(M.state.terminal_buf) then
 		local job_id = vim.b[M.state.terminal_buf].terminal_job_id
 		if job_id then
-			-- Send the selected text to the terminal
-			vim.fn.jobsend(job_id, text_content)
-			logger.info("command", "Sent selection to OpenCode terminal: " .. string.len(text_content) .. " characters")
-
-			-- Focus the opencode terminal
+			vim.fn.jobsend(job_id, message)
+			logger.info("command", "Sent file content: " .. formatted_path)
 			M.focus_opencode()
 			return true
 		end
 	end
 
-	-- Fallback: broadcast to server
-	-- Get line numbers for the server params
-	local start_pos = vim.fn.getpos("'<")
-	local end_pos = vim.fn.getpos("'>")
-	local params = {
-		text = text_content,
-		filePath = file_path,
-		lineStart = start_pos[2] - 1, -- Convert to 0-based
-		lineEnd = end_pos[2] - 1,
-		context = "selection",
-	}
+	logger.error("command", "OpenCode terminal not available")
+	return false
+end
 
-	local success = M.state.server.broadcast("text_selected", params)
-	if success then
-		logger.debug("command", "Sent selection to OpenCode via server")
-		M.focus_opencode()
-		return true
-	else
-		logger.error("command", "Failed to send selection to OpenCode")
-		return false, "Failed to send selection"
+-- Send selected text to opencode
+function M.send_selection()
+	-- Save current register content
+	local save_reg = vim.fn.getreg('"')
+	local save_regtype = vim.fn.getregtype('"')
+
+	-- Yank the visual selection to get the text
+	vim.cmd('normal! gv"zy')
+	local selected_text = vim.fn.getreg("z")
+
+	-- Restore the register
+	vim.fn.setreg('"', save_reg, save_regtype)
+
+	if selected_text == "" then
+		logger.error("command", "No text selected")
+		return false, "No selection"
 	end
+
+	-- Use send_to_opencode function for accurate line counting
+	if M.state.port then
+		local success = send_to_opencode(M.state.port, selected_text)
+		if success then
+			logger.info("command", "Sent selection to OpenCode: " .. string.len(selected_text) .. " characters")
+			M.focus_opencode()
+			return true
+		else
+			logger.error("command", "Failed to send selection via API")
+		end
+	else
+		logger.error("command", "OpenCode server not available")
+	end
+
+	return false, "Failed to send selection"
 end
 
 -- Focus management
@@ -1075,44 +503,49 @@ end
 
 -- Send clipboard content to opencode
 function M.send_clipboard()
-	if not M.state.server then
-		logger.error("command", "OpenCode integration is not running")
-		return false, "Integration not running"
+	-- Get clipboard content from system clipboard
+	local clipboard_text = vim.fn.getreg('+')
+	if clipboard_text == "" then
+		-- Fallback to unnamed register if system clipboard is empty
+		clipboard_text = vim.fn.getreg('"')
 	end
 
-	-- Get clipboard content (yank register)
-	local clipboard_text = vim.fn.getreg('"')
-	
 	if clipboard_text == "" then
 		logger.error("command", "No text in clipboard")
 		return false, "No clipboard content"
 	end
 
-	-- Send to opencode terminal directly by typing the text
+	-- Copy to system clipboard (in case it was from unnamed register)
+	vim.fn.setreg('+', clipboard_text)
+	vim.fn.setreg('*', clipboard_text) -- Also set the selection register for compatibility
+
+	-- Focus OpenCode terminal so user can paste
 	if M.state.terminal_buf and vim.api.nvim_buf_is_valid(M.state.terminal_buf) then
+		M.focus_opencode()
+		-- Send Ctrl+V to paste (this will trigger OpenCode's paste detection)
 		local job_id = vim.b[M.state.terminal_buf].terminal_job_id
 		if job_id then
-			-- Send the clipboard text to the terminal
-			vim.fn.jobsend(job_id, clipboard_text)
-			logger.info("command", "Sent clipboard to OpenCode terminal: " .. string.len(clipboard_text) .. " characters")
-
-			-- Focus the opencode terminal
-			M.focus_opencode()
+			-- Wait a moment then paste
+			vim.defer_fn(function()
+				if vim.api.nvim_buf_is_valid(M.state.terminal_buf) then
+					vim.fn.jobsend(job_id, "\x16") -- Ctrl+V
+				end
+			end, 100)
+			
+			logger.info(
+				"command",
+				"Sent clipboard to OpenCode terminal: " .. string.len(clipboard_text) .. " characters"
+			)
 			return true
 		end
 	end
 
-	logger.error("command", "Failed to send clipboard content")
-	return false, "Failed to send"
+	logger.error("command", "OpenCode terminal not available")
+	return false, "Terminal not available"
 end
 
 -- Clear the OpenCode input box
 function M.clear_input()
-	if not M.state.server then
-		logger.error("command", "OpenCode integration is not running")
-		return false, "Integration not running"
-	end
-
 	-- Send command to clear the input box in opencode terminal
 	if M.state.terminal_buf and vim.api.nvim_buf_is_valid(M.state.terminal_buf) then
 		local job_id = vim.b[M.state.terminal_buf].terminal_job_id
@@ -1124,14 +557,14 @@ function M.clear_input()
 		end
 	end
 
-	logger.error("command", "Failed to clear input")
-	return false, "Failed to clear"
+	logger.error("command", "OpenCode terminal not available")
+	return false, "Terminal not available"
 end
 
 -- Handle ESC key press for double ESC detection
 function M.handle_esc()
 	local current_time = vim.loop.hrtime() / 1000000 -- Convert to milliseconds
-	
+
 	if M.state.last_esc_time and (current_time - M.state.last_esc_time) < 500 then
 		-- Double ESC detected within 500ms
 		M.state.last_esc_time = nil
@@ -1148,24 +581,31 @@ function M.focus_nvim()
 	-- Find the main editing window (skip terminal, explorer, and other special buffers)
 	local windows = vim.api.nvim_list_wins()
 	local main_win = nil
-	
+
 	for _, win in ipairs(windows) do
 		if win ~= M.state.terminal_win and vim.api.nvim_win_is_valid(win) then
 			local buf = vim.api.nvim_win_get_buf(win)
 			local buf_type = vim.api.nvim_buf_get_option(buf, "buftype")
 			local buf_name = vim.api.nvim_buf_get_name(buf)
 			local filetype = vim.api.nvim_buf_get_option(buf, "filetype")
-			
+
 			-- Skip terminal, explorer, and other special buffers
-			if buf_type == "" and filetype ~= "NvimTree" and filetype ~= "neo-tree" and 
-			   filetype ~= "oil" and filetype ~= "dirvish" and filetype ~= "netrw" and
-			   not buf_name:match("NvimTree") and not buf_name:match("neo%-tree") then
+			if
+				buf_type == ""
+				and filetype ~= "NvimTree"
+				and filetype ~= "neo-tree"
+				and filetype ~= "oil"
+				and filetype ~= "dirvish"
+				and filetype ~= "netrw"
+				and not buf_name:match("NvimTree")
+				and not buf_name:match("neo%-tree")
+			then
 				main_win = win
 				break
 			end
 		end
 	end
-	
+
 	if main_win then
 		vim.api.nvim_set_current_win(main_win)
 		M.state.last_focus = "nvim"
@@ -1183,6 +623,487 @@ function M.toggle_focus()
 	end
 end
 
+
+
+-- Session Management API
+function M.create_session(provider, model)
+	if not M.state.port then
+		logger.error("session", "OpenCode server not running")
+		return nil
+	end
+
+	local data = {}
+	if provider then data.provider = provider end
+	if model then data.model = model end
+
+	local success, result = http_request(M.state.port, "/session", "POST", data)
+	if success and result and result.id then
+		M.state.current_session = result.id
+		logger.info("session", "Created session: " .. result.id)
+		return result
+	else
+		logger.error("session", "Failed to create session: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+function M.list_sessions()
+	if not M.state.port then
+		logger.error("session", "OpenCode server not running")
+		return nil
+	end
+
+	local success, result = http_request(M.state.port, "/session")
+	if success then
+		return result
+	else
+		logger.error("session", "Failed to list sessions: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+function M.delete_session(session_id)
+	if not M.state.port then
+		logger.error("session", "OpenCode server not running")
+		return false
+	end
+
+	session_id = session_id or M.state.current_session
+	if not session_id then
+		logger.error("session", "No session ID provided")
+		return false
+	end
+
+	local success, result = http_request(M.state.port, "/session/" .. session_id, "DELETE")
+	if success then
+		if M.state.current_session == session_id then
+			M.state.current_session = nil
+		end
+		logger.info("session", "Deleted session: " .. session_id)
+		return true
+	else
+		logger.error("session", "Failed to delete session: " .. (result or "unknown error"))
+		return false
+	end
+end
+
+function M.send_message(message, session_id)
+	if not M.state.port then
+		logger.error("session", "OpenCode server not running")
+		return nil
+	end
+
+	session_id = session_id or M.state.current_session
+	if not session_id then
+		logger.error("session", "No session ID provided")
+		return nil
+	end
+
+	local data = { message = message }
+	local success, result = http_request(M.state.port, "/session/" .. session_id .. "/message", "POST", data)
+	if success then
+		logger.info("session", "Sent message to session: " .. session_id)
+		return result
+	else
+		logger.error("session", "Failed to send message: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+function M.get_session_messages(session_id)
+	if not M.state.port then
+		logger.error("session", "OpenCode server not running")
+		return nil
+	end
+
+	session_id = session_id or M.state.current_session
+	if not session_id then
+		logger.error("session", "No session ID provided")
+		return nil
+	end
+
+	local success, result = http_request(M.state.port, "/session/" .. session_id .. "/message")
+	if success then
+		return result
+	else
+		logger.error("session", "Failed to get messages: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+-- File Management API
+function M.read_file(file_path)
+	if not M.state.port then
+		logger.error("file", "OpenCode server not running")
+		return nil
+	end
+
+	local success, result = http_request(M.state.port, "/file?path=" .. vim.fn.shellescape(file_path))
+	if success then
+		return result
+	else
+		logger.error("file", "Failed to read file: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+function M.find_text(query, file_pattern)
+	if not M.state.port then
+		logger.error("search", "OpenCode server not running")
+		return nil
+	end
+
+	local params = "?query=" .. vim.fn.shellescape(query)
+	if file_pattern then
+		params = params .. "&pattern=" .. vim.fn.shellescape(file_pattern)
+	end
+
+	local success, result = http_request(M.state.port, "/find" .. params)
+	if success then
+		return result
+	else
+		logger.error("search", "Failed to search text: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+function M.find_files(pattern)
+	if not M.state.port then
+		logger.error("search", "OpenCode server not running")
+		return nil
+	end
+
+	local success, result = http_request(M.state.port, "/find/file?pattern=" .. vim.fn.shellescape(pattern))
+	if success then
+		return result
+	else
+		logger.error("search", "Failed to search files: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+function M.find_symbols(query)
+	if not M.state.port then
+		logger.error("search", "OpenCode server not running")
+		return nil
+	end
+
+	local success, result = http_request(M.state.port, "/find/symbol?query=" .. vim.fn.shellescape(query))
+	if success then
+		return result
+	else
+		logger.error("search", "Failed to search symbols: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+-- App Information API
+function M.get_app_info()
+	if not M.state.port then
+		logger.error("app", "OpenCode server not running")
+		return nil
+	end
+
+	local success, result = http_request(M.state.port, "/app")
+	if success then
+		return result
+	else
+		logger.error("app", "Failed to get app info: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+function M.get_config()
+	if not M.state.port then
+		logger.error("config", "OpenCode server not running")
+		return nil
+	end
+
+	local success, result = http_request(M.state.port, "/config")
+	if success then
+		return result
+	else
+		logger.error("config", "Failed to get config: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+function M.get_providers()
+	if not M.state.port then
+		logger.error("config", "OpenCode server not running")
+		return nil
+	end
+
+	local success, result = http_request(M.state.port, "/config/providers")
+	if success then
+		return result
+	else
+		logger.error("config", "Failed to get providers: " .. (result or "unknown error"))
+		return nil
+	end
+end
+
+-- TUI Control API
+function M.open_help()
+	if not M.state.port then
+		logger.error("tui", "OpenCode server not running")
+		return false
+	end
+
+	local success, result = http_request(M.state.port, "/tui/open-help", "POST")
+	if success then
+		logger.info("tui", "Opened help dialog")
+		return true
+	else
+		logger.error("tui", "Failed to open help: " .. (result or "unknown error"))
+		return false
+	end
+end
+
+-- Logging API
+function M.send_log(level, message, context)
+	if not M.state.port then
+		return -- Don't log errors when logging itself
+	end
+
+	local data = {
+		level = level or "info",
+		message = message,
+		context = context or "nvim-plugin"
+	}
+
+	local success = http_request(M.state.port, "/log", "POST", data)
+	if not success then
+		-- Don't spam console if logging fails
+	end
+end
+
+-- Send current buffer context to OpenCode
+function M.send_current_file()
+	local file_path = vim.api.nvim_buf_get_name(0)
+	if file_path == "" then
+		logger.error("command", "No file in current buffer")
+		return false
+	end
+
+	return M.send_file(file_path)
+end
+
+-- Send current buffer with cursor context (surrounding lines)
+function M.send_current_context(lines_before, lines_after)
+	lines_before = lines_before or 10
+	lines_after = lines_after or 10
+
+	local file_path = vim.api.nvim_buf_get_name(0)
+	if file_path == "" then
+		logger.error("command", "No file in current buffer")
+		return false
+	end
+
+	-- Get current cursor position
+	local cursor = vim.api.nvim_win_get_cursor(0)
+	local current_line = cursor[1] -- 1-based
+	local current_col = cursor[2] -- 0-based
+
+	-- Get buffer content
+	local total_lines = vim.api.nvim_buf_line_count(0)
+	local start_line = math.max(1, current_line - lines_before)
+	local end_line = math.min(total_lines, current_line + lines_after)
+
+	local lines = vim.api.nvim_buf_get_lines(0, start_line - 1, end_line, false)
+	local content = table.concat(lines, "\n")
+
+	-- Get relative path
+	local formatted_path = file_path
+	local cwd = vim.fn.getcwd()
+	if string.find(file_path, cwd, 1, true) == 1 then
+		formatted_path = string.sub(file_path, #cwd + 2)
+	end
+
+	-- Format message with cursor position indicator
+	local message = string.format(
+		"File: %s (lines %d-%d, cursor at line %d, col %d)\n```\n%s\n```",
+		formatted_path, start_line, end_line, current_line, current_col + 1, content
+	)
+
+	-- Send to OpenCode terminal
+	if M.state.terminal_buf and vim.api.nvim_buf_is_valid(M.state.terminal_buf) then
+		local job_id = vim.b[M.state.terminal_buf].terminal_job_id
+		if job_id then
+			vim.fn.jobsend(job_id, message)
+			logger.info("command", "Sent current context: " .. formatted_path .. " around line " .. current_line)
+			M.focus_opencode()
+			return true
+		end
+	end
+
+	logger.error("command", "OpenCode terminal not available")
+	return false
+end
+
+-- Send current function/method context to OpenCode
+function M.send_current_function()
+	local file_path = vim.api.nvim_buf_get_name(0)
+	if file_path == "" then
+		logger.error("command", "No file in current buffer")
+		return false
+	end
+
+	-- Try to find the current function using treesitter if available
+	local has_ts, ts_utils = pcall(require, "nvim-treesitter.ts_utils")
+	if has_ts then
+		local current_node = ts_utils.get_node_at_cursor()
+		if current_node then
+			-- Walk up the tree to find a function node
+			local function_node = current_node
+			while function_node do
+				local node_type = function_node:type()
+				if node_type:match("function") or node_type:match("method") or node_type:match("def") then
+					break
+				end
+				function_node = function_node:parent()
+			end
+
+			if function_node then
+				local start_row, start_col, end_row, end_col = function_node:range()
+				-- Send the function range
+				return M.send_file(file_path, start_row, end_row)
+			end
+		end
+	end
+
+	-- Fallback: send context around cursor if treesitter is not available
+	logger.info("command", "Treesitter not available, sending cursor context instead")
+	return M.send_current_context(20, 20)
+end
+
+-- Add current file context to OpenCode session
+function M.add_file_context()
+	local file_path = vim.api.nvim_buf_get_name(0)
+	if file_path == "" then
+		logger.error("context", "No file in current buffer")
+		return false
+	end
+
+	-- Check if context is already added
+	if M.state.file_context_added and M.state.file_context_path == file_path then
+		logger.info("context", "File context already added")
+		return true
+	end
+
+	-- Send file content with a context marker
+	local formatted_path = file_path
+	local cwd = vim.fn.getcwd()
+	if string.find(file_path, cwd, 1, true) == 1 then
+		formatted_path = string.sub(file_path, #cwd + 2)
+	end
+
+	-- Read entire file
+	local lines = vim.fn.readfile(file_path)
+	local content = table.concat(lines, "\n")
+
+	-- Format message with context marker
+	local message = string.format(
+		"[CONTEXT ADDED] File: %s\n```\n%s\n```\n\nThis file is now in context. You can reference it in our conversation.",
+		formatted_path, content
+	)
+
+	-- Use send_to_opencode function for accurate line counting
+	if M.state.port then
+		local success = send_to_opencode(M.state.port, message)
+		if success then
+			M.state.file_context_added = true
+			M.state.file_context_path = file_path
+			logger.info("context", "Added file context: " .. formatted_path .. " (" .. #lines .. " lines)")
+			M.focus_opencode()
+			return true
+		else
+			logger.error("context", "Failed to add file context via API")
+		end
+	else
+		logger.error("context", "OpenCode server not available")
+	end
+
+	return false
+end
+
+-- Remove current file context from OpenCode session
+function M.remove_file_context()
+	if not M.state.file_context_added then
+		logger.info("context", "No file context to remove")
+		return true
+	end
+
+	-- Get the formatted path for the message
+	local formatted_path = M.state.file_context_path
+	local cwd = vim.fn.getcwd()
+	if string.find(M.state.file_context_path, cwd, 1, true) == 1 then
+		formatted_path = string.sub(M.state.file_context_path, #cwd + 2)
+	end
+
+	-- Send context removal message
+	local message = string.format(
+		"[CONTEXT REMOVED] File: %s is no longer in context. Please ignore previous file content unless specifically referenced.",
+		formatted_path
+	)
+
+	-- Send to opencode terminal
+	if M.state.terminal_buf and vim.api.nvim_buf_is_valid(M.state.terminal_buf) then
+		local job_id = vim.b[M.state.terminal_buf].terminal_job_id
+		if job_id then
+			vim.fn.jobsend(job_id, message)
+			M.state.file_context_added = false
+			M.state.file_context_path = nil
+			logger.info("context", "Removed file context: " .. formatted_path)
+			M.focus_opencode()
+			return true
+		end
+	end
+
+	logger.error("context", "OpenCode terminal not available")
+	return false
+end
+
+-- Toggle file context
+function M.toggle_file_context()
+	if M.state.file_context_added then
+		return M.remove_file_context()
+	else
+		return M.add_file_context()
+	end
+end
+
+-- Diff management functions (stubs for now)
+function M.accept_diff_hunk(file_path, hunk_index)
+	logger.info("diff", "Accept diff hunk not implemented yet: " .. file_path .. " hunk " .. hunk_index)
+	return false
+end
+
+function M.reject_diff_hunk(file_path, hunk_index)
+	logger.info("diff", "Reject diff hunk not implemented yet: " .. file_path .. " hunk " .. hunk_index)
+	return false
+end
+
+function M.accept_all_diffs(file_path)
+	logger.info("diff", "Accept all diffs not implemented yet: " .. file_path)
+	return false
+end
+
+function M.reject_all_diffs(file_path)
+	logger.info("diff", "Reject all diffs not implemented yet: " .. file_path)
+	return false
+end
+
+function M.prev_diff_file()
+	logger.info("diff", "Navigate to previous diff file not implemented yet")
+	return false
+end
+
+function M.next_diff_file()
+	logger.info("diff", "Navigate to next diff file not implemented yet")
+	return false
+end
+
 -- Setup function
 function M.setup(opts)
 	opts = opts or {}
@@ -1190,22 +1111,9 @@ function M.setup(opts)
 	-- Merge config
 	M.state.config = vim.tbl_deep_extend("force", default_config, opts)
 
+
+
 	-- Create commands
-	vim.api.nvim_create_user_command("OpenCodeStart", function()
-		M.start()
-	end, { desc = "Start OpenCode integration" })
-
-	vim.api.nvim_create_user_command("OpenCodeStop", function()
-		M.stop()
-	end, { desc = "Stop OpenCode integration" })
-
-	vim.api.nvim_create_user_command("OpenCodeStatus", function()
-		if M.state.server and M.state.port then
-			logger.info("command", "OpenCode integration is running on port " .. tostring(M.state.port))
-		else
-			logger.info("command", "OpenCode integration is not running")
-		end
-	end, { desc = "Show OpenCode integration status" })
 
 	vim.api.nvim_create_user_command("OpenCode", function()
 		M.toggle_terminal()
@@ -1239,115 +1147,239 @@ function M.setup(opts)
 		M.toggle_focus()
 	end, { desc = "Toggle focus between Neovim and OpenCode" })
 
-	vim.api.nvim_create_user_command("OpenCodeShowDiff", function()
-		local file_path = vim.api.nvim_buf_get_name(0)
-		if file_path == "" then
-			logger.error("command", "No file in current buffer")
-			return
+	-- Session Management Commands
+	vim.api.nvim_create_user_command("OpenCodeCreateSession", function(cmd_opts)
+		local args = vim.split(cmd_opts.args, " ")
+		local provider = args[1]
+		local model = args[2]
+		local session = M.create_session(provider, model)
+		if session then
+			print("Created session: " .. session.id)
+		else
+			print("Failed to create session")
 		end
-		M.show_inline_diffs(file_path)
-	end, { desc = "Show inline diffs for current file" })
+	end, { nargs = "*", desc = "Create new OpenCode session [provider] [model]" })
 
-	vim.api.nvim_create_user_command("OpenCodeAcceptDiff", function(opts)
-		local file_path = vim.api.nvim_buf_get_name(0)
-		if file_path == "" then
-			logger.error("command", "No file in current buffer")
-			return
+	vim.api.nvim_create_user_command("OpenCodeListSessions", function()
+		local sessions = M.list_sessions()
+		if sessions then
+			print("OpenCode Sessions:")
+			for _, session in ipairs(sessions) do
+				local current = (session.id == M.state.current_session) and " (current)" or ""
+				print("  " .. session.id .. current)
+			end
+		else
+			print("Failed to get sessions")
 		end
-		local hunk_idx = tonumber(opts.args) or 1
-		M.accept_diff_hunk(file_path, hunk_idx)
-	end, { nargs = "?", desc = "Accept diff hunk (default: first hunk)" })
+	end, { desc = "List OpenCode sessions" })
 
-	vim.api.nvim_create_user_command("OpenCodeRejectDiff", function(opts)
-		local file_path = vim.api.nvim_buf_get_name(0)
-		if file_path == "" then
-			logger.error("command", "No file in current buffer")
-			return
+	vim.api.nvim_create_user_command("OpenCodeDeleteSession", function(cmd_opts)
+		local session_id = cmd_opts.args ~= "" and cmd_opts.args or nil
+		if M.delete_session(session_id) then
+			print("Session deleted")
+		else
+			print("Failed to delete session")
 		end
-		local hunk_idx = tonumber(opts.args) or 1
-		M.reject_diff_hunk(file_path, hunk_idx)
-	end, { nargs = "?", desc = "Reject diff hunk (default: first hunk)" })
+	end, { nargs = "?", desc = "Delete OpenCode session [session_id]" })
 
-	vim.api.nvim_create_user_command("OpenCodeAcceptAllDiffs", function()
-		local file_path = vim.api.nvim_buf_get_name(0)
-		if file_path == "" then
-			logger.error("command", "No file in current buffer")
+	vim.api.nvim_create_user_command("OpenCodeSendMessage", function(cmd_opts)
+		if cmd_opts.args == "" then
+			print("Please provide a message")
 			return
 		end
-		M.accept_all_diffs(file_path)
-	end, { desc = "Accept all diffs in current file" })
+		local result = M.send_message(cmd_opts.args)
+		if result then
+			print("Message sent")
+		else
+			print("Failed to send message")
+		end
+	end, { nargs = "+", desc = "Send message to current session" })
 
-	vim.api.nvim_create_user_command("OpenCodeRejectAllDiffs", function()
-		local file_path = vim.api.nvim_buf_get_name(0)
-		if file_path == "" then
-			logger.error("command", "No file in current buffer")
+	vim.api.nvim_create_user_command("OpenCodeGetMessages", function(cmd_opts)
+		local session_id = cmd_opts.args ~= "" and cmd_opts.args or nil
+		local messages = M.get_session_messages(session_id)
+		if messages then
+			print("Session Messages:")
+			for i, msg in ipairs(messages) do
+				print(i .. ". [" .. (msg.role or "unknown") .. "] " .. (msg.content or "[empty]"))
+			end
+		else
+			print("Failed to get messages")
+		end
+	end, { nargs = "?", desc = "Get messages from session [session_id]" })
+
+	-- Search Commands
+	vim.api.nvim_create_user_command("OpenCodeFindText", function(cmd_opts)
+		if cmd_opts.args == "" then
+			print("Please provide search query")
 			return
 		end
-		M.reject_all_diffs(file_path)
-	end, { desc = "Reject all diffs in current file" })
+		local args = vim.split(cmd_opts.args, " ", { trimempty = true })
+		local query = args[1]
+		local pattern = args[2]
+		local results = M.find_text(query, pattern)
+		if results then
+			print("Search results for '" .. query .. "':")
+			if type(results) == "table" then
+				for _, result in ipairs(results) do
+					print("  " .. (result.file or "unknown") .. ":" .. (result.line or "?") .. " - " .. (result.text or ""))
+				end
+			else
+				print(vim.inspect(results))
+			end
+		else
+			print("Failed to search text")
+		end
+	end, { nargs = "+", desc = "Search for text in files [query] [pattern]" })
+
+	vim.api.nvim_create_user_command("OpenCodeFindFiles", function(cmd_opts)
+		if cmd_opts.args == "" then
+			print("Please provide file pattern")
+			return
+		end
+		local results = M.find_files(cmd_opts.args)
+		if results then
+			print("File search results for '" .. cmd_opts.args .. "':")
+			if type(results) == "table" then
+				for _, file in ipairs(results) do
+					print("  " .. file)
+				end
+			else
+				print(vim.inspect(results))
+			end
+		else
+			print("Failed to search files")
+		end
+	end, { nargs = "+", desc = "Search for files by pattern" })
+
+	vim.api.nvim_create_user_command("OpenCodeFindSymbols", function(cmd_opts)
+		if cmd_opts.args == "" then
+			print("Please provide symbol query")
+			return
+		end
+		local results = M.find_symbols(cmd_opts.args)
+		if results then
+			print("Symbol search results for '" .. cmd_opts.args .. "':")
+			if type(results) == "table" then
+				for _, symbol in ipairs(results) do
+					print("  " .. (symbol.name or "unknown") .. " in " .. (symbol.file or "unknown") .. ":" .. (symbol.line or "?"))
+				end
+			else
+				print(vim.inspect(results))
+			end
+		else
+			print("Failed to search symbols")
+		end
+	end, { nargs = "+", desc = "Search for symbols" })
+
+	-- Information Commands
+	vim.api.nvim_create_user_command("OpenCodeInfo", function()
+		local info = M.get_app_info()
+		if info then
+			print("OpenCode App Info:")
+			print(vim.inspect(info))
+		else
+			print("Failed to get app info")
+		end
+	end, { desc = "Get OpenCode application information" })
+
+	vim.api.nvim_create_user_command("OpenCodeConfig", function()
+		local config = M.get_config()
+		if config then
+			print("OpenCode Configuration:")
+			print(vim.inspect(config))
+		else
+			print("Failed to get config")
+		end
+	end, { desc = "Get OpenCode configuration" })
+
+	vim.api.nvim_create_user_command("OpenCodeProviders", function()
+		local providers = M.get_providers()
+		if providers then
+			print("Available Providers:")
+			if type(providers) == "table" then
+				for name, provider in pairs(providers) do
+					print("  " .. name .. ": " .. (provider.description or "no description"))
+					if provider.models then
+						for _, model in ipairs(provider.models) do
+							print("    - " .. model)
+						end
+					end
+				end
+			else
+				print(vim.inspect(providers))
+			end
+		else
+			print("Failed to get providers")
+		end
+	end, { desc = "List available AI providers and models" })
+
+	-- TUI Commands
+	vim.api.nvim_create_user_command("OpenCodeHelp", function()
+		if M.open_help() then
+			print("Opened OpenCode help")
+		else
+			print("Failed to open help")
+		end
+	end, { desc = "Open OpenCode help dialog" })
+
+	-- Context Commands (easy file sharing)
+	vim.api.nvim_create_user_command("OpenCodeSendFile", function()
+		M.send_current_file()
+	end, { desc = "Send current file to OpenCode" })
+
+	vim.api.nvim_create_user_command("OpenCodeSendContext", function(cmd_opts)
+		local args = vim.split(cmd_opts.args, " ")
+		local lines_before = tonumber(args[1]) or 10
+		local lines_after = tonumber(args[2]) or lines_before
+		M.send_current_context(lines_before, lines_after)
+	end, { nargs = "*", desc = "Send current context to OpenCode [lines_before] [lines_after]" })
+
+	vim.api.nvim_create_user_command("OpenCodeSendFunction", function()
+		M.send_current_function()
+	end, { desc = "Send current function/method to OpenCode" })
+
+
 
 	vim.api.nvim_create_user_command("OpenCodeTestSelection", function()
 		-- Test function to debug selection using the yank method
 		print("Testing selection capture...")
-		
+
 		-- Save current register content
 		local save_reg = vim.fn.getreg('"')
 		local save_regtype = vim.fn.getregtype('"')
-		
+
 		-- Yank the visual selection to get the text
 		vim.cmd('normal! gv"zy')
-		local selected_text = vim.fn.getreg('z')
-		
+		local selected_text = vim.fn.getreg("z")
+
 		-- Restore the register
 		vim.fn.setreg('"', save_reg, save_regtype)
-		
+
 		if selected_text == "" then
 			print("No text selected")
 		else
 			print("Selected text: '" .. selected_text .. "'")
 			print("Length: " .. string.len(selected_text) .. " characters")
-			local lines = vim.split(selected_text, '\n', {plain = true})
+			local lines = vim.split(selected_text, "\n", { plain = true })
 			print("Lines: " .. #lines)
 		end
 	end, { desc = "Test selection capture" })
 
-	-- Set up diff signs
-	vim.fn.sign_define("OpenCodeDiffAdd", {
-		text = "+",
-		texthl = "DiffAdd",
-		linehl = "",
-		numhl = "DiffAdd"
-	})
-	
-	vim.fn.sign_define("OpenCodeDiffChange", {
-		text = "~",
-		texthl = "DiffChange",
-		linehl = "",
-		numhl = "DiffChange"
-	})
-	
-	vim.fn.sign_define("OpenCodeDiffDelete", {
-		text = "-",
-		texthl = "DiffDelete",
-		linehl = "",
-		numhl = "DiffDelete"
-	})
 
-	-- Auto-start if configured
+
+	-- Set up global keymaps for easy file context toggling
+	vim.api.nvim_set_keymap("n", "<leader>+", ':lua require("opencode").add_file_context()<CR>', 
+		{ noremap = true, silent = true, desc = "Add current file to OpenCode context" })
+	vim.api.nvim_set_keymap("n", "<leader>-", ':lua require("opencode").remove_file_context()<CR>', 
+		{ noremap = true, silent = true, desc = "Remove current file from OpenCode context" })
+	vim.api.nvim_set_keymap("n", "<leader>=", ':lua require("opencode").toggle_file_context()<CR>', 
+		{ noremap = true, silent = true, desc = "Toggle current file context in OpenCode" })
+
+	-- Auto-start terminal if configured
 	if M.state.config.auto_start then
-		M.start()
+		M.toggle_terminal()
 	end
-
-	-- Cleanup on exit
-	vim.api.nvim_create_autocmd("VimLeavePre", {
-		group = vim.api.nvim_create_augroup("OpenCodeShutdown", { clear = true }),
-		callback = function()
-			if M.state.server then
-				M.stop()
-			end
-		end,
-		desc = "Automatically stop OpenCode integration when exiting Neovim",
-	})
 
 	M.state.initialized = true
 	return M

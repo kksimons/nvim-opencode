@@ -1,27 +1,20 @@
 # nvim-opencode
 
-A Neovim plugin that integrates [opencode](https://opencode.ai) directly into your editor.
+A Neovim plugin that integrates [OpenCode](https://opencode.ai) directly into your editor.
 
 ## Features
 
-- Toggle opencode terminal with `<leader>A`
-- Send visual selections to opencode with `a` in visual mode
-- Send clipboard content to opencode with `a` in normal mode
-- Clear opencode input with double `ESC` (works from anywhere)
-- Quick focus switching with `0` (opencode) and `1` (editor)
-- File change detection with automatic diff display
-- Persistent session management (maintains connection when window is closed)
-- Multiple window positions: floating, bottom split, right split
-- Configurable terminal size and behavior
-- Automatic cleanup when terminal exits
-- LazyVim compatible
+- **Terminal Management**: Toggle OpenCode terminal with `\<leader\>A`
+- **Text Sharing**: Send selections and clipboard content with accurate line counting
+- **File Context Management**: Add/remove entire files from OpenCode context
+- **Session Persistence**: Maintains connection when window is closed/reopened
 
 ## Installation
 
 ### Prerequisites
 
-- Neovim >= 0.8
-- [opencode](https://opencode.ai) installed and available in your PATH
+- Neovim \>= 0.8
+- [OpenCode](https://opencode.ai) installed and available in your PATH
 
 ### Using [lazy.nvim](https://github.com/folke/lazy.nvim) (recommended)
 
@@ -31,16 +24,11 @@ A Neovim plugin that integrates [opencode](https://opencode.ai) directly into yo
   config = function()
     require("opencode").setup({
       -- Default configuration (all optional)
+      auto_start = true,                          -- Auto-start terminal on plugin load
+      terminal_cmd = nil,                         -- Custom opencode command (nil = auto-detect)
       terminal = {
-        split_side = "right",           -- "left", "right", "top", "bottom"
-        split_width_percentage = 0.30,  -- 30% of screen width/height
-        provider = "auto",              -- "auto", "native"
-        auto_close = true,              -- Close terminal when opencode exits
-      },
-      file_watcher = {
-        enabled = true,        -- Enable file change detection
-        show_diffs = true,     -- Show diffs when files change
-        auto_reload = false,   -- Auto-reload changed files
+        split_side = "right",                     -- "left" or "right"
+        split_width_percentage = 0.30,            -- 30% of screen width
       },
     })
   end,
@@ -72,153 +60,80 @@ use {
    require("opencode").setup()
    ```
 
-## Usage
+## Key Mappings
 
-### Key Mappings
+### Terminal Management
 
-#### Focus Control
+- `\<leader\>A` - Toggle OpenCode terminal (show/hide while preserving session)
 
-- `0` - Focus opencode terminal
-- `1` - Focus Neovim editor (skips file explorers, focuses main editing window)
+### Text Sharing
 
-#### Sending Content to OpenCode
+- `a` (visual mode) - Send selected text to OpenCode with accurate line counting
+- `a` (normal mode) - Send clipboard/yank register content to OpenCode
+- Double `ESC` - Clear current input line in OpenCode
+- Ctrl+U - Clear entire input in OpenCode
 
-- `a` (visual mode) - Send selected text to opencode
-- `a` (normal mode) - Send clipboard/yank register content to opencode
-- `ESC ESC` (double ESC) - Clear opencode input box (works from anywhere)
+### File Context Management
 
-#### Terminal Management
+- `\<leader\>+` - Add current file to OpenCode context (prevents duplicates)
+- `\<leader\>-` - Remove current file from OpenCode context
+- `\<leader\>=` - Toggle current file context in OpenCode
 
-- `<leader>A` - Toggle opencode terminal
-- `<C-w>a` - Toggle focus between nvim and opencode (legacy keybinding)
+### Focus Control (in OpenCode terminal)
 
-#### Diff Management
+- `1` - Focus on Neovim editor (skips file explorers, focuses main editing window)
+- `9` - Focus on OpenCode terminal
 
-- `<leader>da` - Accept current diff hunk
-- `<leader>dr` - Reject current diff hunk
-- `<leader>dd` - Accept all diffs in current file
-- `<leader>dR` - Reject all diffs in current file
+## Basic Usage
 
-### Commands
+1. Open a file in Neovim
+2. Press `\<leader\>A` to open OpenCode terminal
+3. Select some code in visual mode and press `a` to send it
+4. See `[PASTED X lines]` feedback for accurate line count
+5. Use `1` and `9` to switch focus between editor and chat
 
-#### Core Commands
+### File Context Management
 
-- `:OpenCode` - Toggle opencode terminal
-- `:OpenCodeStart` - Start opencode integration
-- `:OpenCodeStop` - Stop opencode integration
-- `:OpenCodeStatus` - Show integration status
-
-#### Content Sending
-
-- `:OpenCodeSend` - Send current file/selection to opencode
-- `:OpenCodeSendSelection` - Send visual selection to opencode
-
-#### Focus Management
-
-- `:OpenCodeFocus` - Focus opencode terminal
-- `:OpenCodeToggleFocus` - Toggle focus between nvim and opencode
-
-#### File Operations
-
-- `:OpenCodeShowDiff` - Show inline diffs for current file
-- `:OpenCodeAcceptDiff [hunk_number]` - Accept specific diff hunk (default: first)
-- `:OpenCodeRejectDiff [hunk_number]` - Reject specific diff hunk (default: first)
-- `:OpenCodeAcceptAllDiffs` - Accept all diffs in current file
-- `:OpenCodeRejectAllDiffs` - Reject all diffs in current file
-
-### Terminal Mode Keybindings
-
-When inside the opencode terminal:
-
-- `0` - Focus opencode terminal (stay in terminal)
-- `1` - Switch focus back to nvim editor
-- `ESC ESC` - Clear line in OpenCode input box only
-- Terminal session persists even when window is closed
+1. Press `\<leader\>+` to add current file to chat context
+2. OpenCode now knows about the entire file for better responses
+3. Press `\<leader\>-` to remove file from context when done or /new for new session
+4. Use `\<leader\>=` to quickly toggle file context on/off
 
 ## Configuration
 
-### Full Configuration Example
+### Default Configuration
 
 ```lua
 require("opencode").setup({
-  -- Connection settings
-  port_range = { min = 10000, max = 65535 },  -- Port range for opencode server
-  auto_start = true,                          -- Auto-start integration on plugin load
+  auto_start = true,                          -- Auto-start terminal on plugin load
   terminal_cmd = nil,                         -- Custom opencode command (nil = auto-detect)
-  log_level = "info",                         -- "trace", "debug", "info", "warn", "error"
-  track_selection = true,                     -- Send selection updates to opencode
-
-  -- Terminal configuration
   terminal = {
-    split_side = "right",                     -- "left", "right", "top", "bottom"
-    split_width_percentage = 0.30,            -- 30% of screen width/height
-    provider = "auto",                        -- "auto", "native"
-    auto_close = true,                        -- Close terminal when opencode exits
-  },
-
-  -- File watching and diff integration
-  file_watcher = {
-    enabled = true,                           -- Enable file change detection
-    show_diffs = true,                        -- Show diffs when files change
-    auto_reload = false,                      -- Auto-reload changed files
-  },
-
-  -- Legacy keymap configuration (most keymaps are now hardcoded)
-  keymaps = {
-    send_selection = "a",                     -- Key to send selection in visual mode
-    toggle_focus = "<C-w>a",                  -- Key to toggle focus
+    split_side = "right",                     -- "left" or "right"
+    split_width_percentage = 0.30,            -- 30% of screen width
   },
 })
 ```
 
-### Terminal Position Options
+### Configuration Options
 
-- **`"right"`** - Vertical split on right side (default, like file explorer)
-- **`"left"`** - Vertical split on left side
-- **`"top"`** - Horizontal split at top
-- **`"bottom"`** - Horizontal split at bottom (like integrated terminal)
+- **`auto_start`** (boolean, default: `true`) - Automatically start OpenCode terminal when plugin loads
+- **`terminal_cmd`** (string, default: `nil`) - Custom OpenCode command. If `nil`, auto-detects from PATH or common install locations
+- **`terminal.split_side`** (string, default: `"right"`) - Terminal position: `"left"` or `"right"`
+- **`terminal.split_width_percentage`** (number, default: `0.30`) - Terminal width as percentage of screen width
 
-### Size Recommendations
+### OpenCode Command Detection
 
-- **Vertical splits** (`"left"`, `"right"`): `0.30` (30% of screen width)
-- **Horizontal splits** (`"top"`, `"bottom"`): `0.40` (40% of screen height)
+The plugin automatically detects OpenCode installation in the following order:
 
-## Workflow Examples
+1. `opencode` in PATH
+2. `~/.local/bin/opencode`
+3. `/usr/local/bin/opencode`
+4. `/opt/homebrew/bin/opencode`
 
-### Basic Usage
+You can override this by setting `terminal_cmd` to a custom path.
 
-1. Open a file in Neovim
-2. Press `<leader>a` to open opencode terminal
-3. Select some code and press `a` to send it to opencode
-4. Use `0` and `1` to quickly switch focus between opencode and editor
+## Notes
 
-### Clipboard Integration
-
-1. Yank some code with `y` (or copy from anywhere)
-2. Press `a` in normal mode to paste it into opencode chat
-3. Double-tap `ESC` to clear the opencode input if needed (line at a time just in case)
-
-### File Explorer Integration
-
-- The `1` key intelligently focuses the main editing window, skipping file explorers like NvimTree, neo-tree, oil, etc.
-- This ensures you always land in the actual file content, not the tree view
-
-### Diff Management Workflow
-
-When OpenCode makes changes to your files, the plugin automatically detects them and shows inline diffs:
-
-1. **Automatic Detection**: File changes are detected via git diff when files are modified
-2. **Inline Display**:
-   - Added lines are highlighted in green with `+` signs
-   - Removed lines appear as virtual text above the changes in red
-   - Each diff hunk shows instructions: `[Hunk 1] <leader>da: accept, <leader>dr: reject, <leader>dd: accept all`
-3. **Accept/Reject**: Use the keybindings to selectively accept or reject changes
-4. **Batch Operations**: Accept or reject all changes at once with `<leader>dd` or `<leader>dR`
-
-**Example workflow:**
-
-1. Ask OpenCode to refactor a function
-2. OpenCode modifies the file
-3. Plugin shows inline diffs with highlights and virtual text
-4. Review changes and press `<leader>da` to accept good changes, `<leader>dr` to reject unwanted ones
-5. Use `<leader>dd` to accept all remaining changes when satisfied
+- Terminal session persists even when window is closed - you can reopen with `\<leader\>A` without losing your chat history
+- The `1` key intelligently skips file explorers (NvimTree, neo-tree, oil) and focuses the main editing window
+- All text sharing shows accurate line counts: `[PASTED 5 lines]` instead of generic "1+ lines"

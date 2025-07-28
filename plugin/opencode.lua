@@ -12,23 +12,23 @@ vim.keymap.set("n", "<leader>A", function()
 	require("opencode").toggle_terminal()
 end, { desc = "Toggle OpenCode terminal" })
 
--- Focus switching with '0' and '1' keys
-vim.keymap.set("n", "0", function()
-	require("opencode").focus_opencode()
-end, { desc = "Focus OpenCode terminal" })
-
+-- Focus switching with '1' and '9' keys
 vim.keymap.set("n", "1", function()
 	require("opencode").focus_nvim()
 end, { desc = "Focus Neovim editor" })
 
--- Also add terminal mode keymaps
-vim.keymap.set("t", "0", function()
+vim.keymap.set("n", "9", function()
 	require("opencode").focus_opencode()
 end, { desc = "Focus OpenCode terminal" })
 
+-- Also add terminal mode keymaps
 vim.keymap.set("t", "1", function()
 	require("opencode").focus_nvim()
 end, { desc = "Focus Neovim editor" })
+
+vim.keymap.set("t", "9", function()
+	require("opencode").focus_opencode()
+end, { desc = "Focus OpenCode terminal" })
 
 -- Keep the original toggle focus for backwards compatibility
 vim.keymap.set("n", "<C-w>a", function()
@@ -97,3 +97,11 @@ vim.keymap.set("n", "<leader>dR", function()
 	end
 end, { desc = "Reject all diffs in current file" })
 
+-- Navigation between files with changes (using different keys to avoid conflict)
+vim.keymap.set("n", "<leader>[", function()
+	require("opencode").prev_diff_file()
+end, { desc = "Navigate to previous file with changes" })
+
+vim.keymap.set("n", "<leader>]", function()
+	require("opencode").next_diff_file()
+end, { desc = "Navigate to next file with changes" })
